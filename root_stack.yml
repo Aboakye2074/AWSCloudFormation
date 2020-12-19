@@ -6,7 +6,7 @@ Resources:
       TemplateURL: user_template.yml
 jobs:
   build:
-    runs-on: amazon linux 2-latest
+    runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v2
     - name: Configure AWS credentials
