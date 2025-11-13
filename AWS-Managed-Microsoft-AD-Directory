@@ -1,0 +1,70 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Provision AWS Managed Microsoft AD with environment tagging and network configuration
+
+Parameters:
+  DirectoryEdition:
+    Type: String
+    Default: Standard
+    AllowedValues: [Standard, Enterprise]
+    Description: Edition of AWS Managed Microsoft AD
+
+  DirectoryName:
+    Type: String
+    Description: Fully qualified domain name (e.g., corp.example.com)
+
+  ShortName:
+    Type: String
+    Description: NetBIOS name of the domain (e.g., CORP)
+
+  VPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where the directory will be deployed
+
+  Subnet1Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: First subnet for directory deployment
+
+  Subnet2Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: Second subnet in a different AZ
+
+  EnvironmentTag:
+    Type: String
+    Default: ADev
+    AllowedValues: [ADev, PrProd, Prod]
+    Description: Environment tag for resource classification
+
+Resources:
+
+  ## AWS Managed Microsoft AD
+  ManagedDirectory:
+    Type: AWS::DirectoryService::MicrosoftAD
+    Properties:
+      Name: !Ref DirectoryName
+      ShortName: !Ref ShortName
+      Password: '{{resolve:secretsmanager:ad-admin-password:SecretString:password}}' # Replace with your secret reference
+      Edition: !Ref DirectoryEdition
+      VpcSettings:
+        VpcId: !Ref VPCId
+        SubnetIds:
+          - !Ref Subnet1Id
+          - !Ref Subnet2Id
+      Tags:
+        - Key: Name
+          Value: !Sub "AD-${EnvironmentTag}"
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+
+Outputs:
+  DirectoryId:
+    Description: ID of the AWS Managed Microsoft AD
+    Value: !Ref ManagedDirectory
+
+  DirectoryDNSName:
+    Description: DNS name of the directory
+    Value: !GetAtt ManagedDirectory.Name
+
+  DirectoryAlias:
+    Description: NetBIOS alias of the directory
+    Value: !GetAtt ManagedDirectory.ShortName
+	
