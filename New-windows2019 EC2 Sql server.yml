@@ -1,0 +1,110 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Windows Server 2019 EC2 instance for SQL migration via AWS DMS
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t3.large
+    Description: EC2 instance type
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair for RDP access
+
+  VPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where EC2 will be deployed
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet for EC2 instance
+
+  SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security Group for EC2 instance
+
+  KmsKeyId:
+    Type: String
+    Description: KMS Key ID or ARN for volume encryption
+
+  EnvironmentTag:
+    Type: String
+    Default: Dev
+    AllowedValues: [Dev, Test, Prod]
+    Description: Environment tag for resource classification
+
+Resources:
+
+  ## IAM Role for EC2 (SSM access optional)
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref EC2InstanceRole]
+
+  ## EC2 Instance (Windows Server 2019)
+  SQLBridgeWindowsInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds: [!Ref SecurityGroupId]
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      ImageId: ami-0b2f6494ff0b07a0e # Windows Server 2019 Base (update per region)
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 100
+            VolumeType: gp3
+            Encrypted: true
+            KmsKeyId: !Ref KmsKeyId
+      Tags:
+        - Key: Name
+          Value: !Sub "DMS-Windows-SQL-Bridge-${EnvironmentTag}"
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+      UserData:
+        Fn::Base64: !Sub |
+          <powershell>
+          Set-ExecutionPolicy RemoteSigned -Force
+
+          # Install Chocolatey (Windows package manager)
+          iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+
+          # Install SQL Server Management Studio
+          choco install sql-server-management-studio -y
+
+          # Optional: Install VPN client or configure tunnel
+          # Write-Output "VPN or tunnel configuration goes here"
+
+          # Log completion
+          Write-Output "SQL client installation complete"
+          </powershell>
+
+Outputs:
+  InstanceId:
+    Description: ID of the Windows EC2 instance
+    Value: !Ref SQLBridgeWindowsInstance
+
+  PublicIP:
+    Description: Private IP for RDP access
+    Value: !GetAtt SQLBridgeWindowsInstance.PrivateIp
+
+  PrivateIP:
+    Description: Private IP for internal routing
+    Value: !GetAtt SQLBridgeWindowsInstance.PrivateIp
+	
+	
