@@ -1,0 +1,96 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Provision a reusable KMS key for encrypting EC2 volumes, DMS tasks, Lambda functions and S3
+
+Parameters:
+  EnvironmentTag:
+    Type: String
+    Default: Dev
+    AllowedValues: [Dev, Test, Prod]
+    Description: Environment tag for resource classification
+
+  KeyAlias:
+    Type: String
+    Default: alias/dms-sql-migration-key
+    Description: Alias for the KMS key
+
+Resources:
+
+  ## KMS Key
+  KMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub "KMS key for ${EnvironmentTag} SQL migration resources"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowRootAccount
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+
+          - Sid: AllowEC2Usage
+            Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: "*"
+
+          - Sid: AllowDMSUsage
+            Effect: Allow
+            Principal:
+              Service: dms.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: "*"
+
+          - Sid: AllowLambdaUsage
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: "*"
+		  - Sid: AllowS3Usage
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: "*"
+	
+            
+  ## KMS Alias
+  KMSAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Ref KeyAlias
+      TargetKeyId: !Ref KMSKey
+
+Outputs:
+  KMSKeyId:
+    Description: ID of the provisioned KMS key
+    Value: !Ref KMSKey
+
+  KMSKeyArn:
+    Description: ARN of the provisioned KMS key
+    Value: !GetAtt KMSKey.Arn
+
+  KMSAliasName:
+    Description: Alias name for the KMS key
+    Value: !Ref KMSAlias
