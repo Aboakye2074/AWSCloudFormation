@@ -1,0 +1,117 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Launch a domain-joined EC2 instance with SQL Server and SSMS, using KMS encryption and SSM access
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t3.large
+	AllowedValues: [t3.large, t3.xlarge, t3.2xlarge]
+    Description: EC2 instance type
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair for RDP access
+
+  VPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where EC2 will be deployed
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet for EC2 instance
+
+  SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security Group for EC2 instance
+
+  DirectoryId:
+    Type: String
+    Description: AWS Directory Service Directory ID (e.g., d-xxxxxxxxxx)
+
+  KmsKeyId:
+    Type: String
+    Description: KMS Key ID or ARN for volume encryption
+
+  EnvironmentTag:
+    Type: String
+    Default: Adv
+    AllowedValues: [Adv, PrProd, Prod]
+    Description: Environment tag for resource classification
+
+Resources:
+
+  ## IAM Role for EC2 with SSM and Directory Join
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "EC2DomainJoinRole-${EnvironmentTag}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonSSMDirectoryServiceAccess
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref EC2InstanceRole]
+
+  ## EC2 Instance with SQL Server and Domain Join
+  SQLServerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds: [!Ref SecurityGroupId]
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      ImageId: ami-0e4d0bbde5e5c8c8f # Replace with latest Windows Server 2019 + SQL Server AMI in your region
+      Tags:
+        - Key: Name
+          Value: !Sub "SQLServer-${EnvironmentTag}"
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 100
+            VolumeType: gp3
+            Encrypted: true
+            KmsKeyId: !Ref KmsKeyId
+      DomainJoin:
+        DirectoryId: !Ref DirectoryId
+        DirectoryName: !Ref DirectoryId
+        IamInstanceProfile: !Ref EC2InstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          <powershell>
+          Set-ExecutionPolicy RemoteSigned -Force
+
+          # Install Chocolatey
+          iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+
+          # Install SQL Server Management Studio
+          choco install sql-server-management-studio -y
+
+          # Optional: Configure firewall or monitoring agents
+          Write-Output "SSMS installed and domain join initiated"
+          </powershell>
+
+Outputs:
+  SQLServerInstanceId:
+    Description: ID of the SQL Server EC2 instance
+    Value: !Ref SQLServerInstance
+
+  SQLServerPrivateIP:
+    Description: Private IP for internal access
+    Value: !GetAtt SQLServerInstance.PrivateIp
+
+  SQLServerPublicIP:
+    Description: Public IP for RDP access (if subnet allows)
+    Value: !GetAtt SQLServerInstance.PublicIp
+	
