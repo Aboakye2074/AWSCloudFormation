@@ -1,0 +1,198 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Provision AWS Managed Microsoft AD and a domain-joined EC2 instance for SQL Server.
+  Includes DHCP options, conditional OU placement, IAM roles, and secure volume configuration.
+
+Parameters:
+  EnvironmentTag:
+    Type: String
+    Default: Dev
+    AllowedValues: [Dev, Test, Prod]
+    Description: Environment tag
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID
+
+  PrivateSubnet1Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet 1 (AZ-A)
+
+  PrivateSubnet2Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet 2 (AZ-B)
+
+  SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security group for EC2
+
+  DirectoryEdition:
+    Type: String
+    Default: Standard
+    AllowedValues: [Standard, Enterprise]
+    Description: AD edition
+
+  DirectoryName:
+    Type: String
+    Description: Fully qualified domain name (e.g., corp.example.com)
+
+  DirectoryShortName:
+    Type: String
+    Description: NetBIOS name (e.g., CORP)
+
+  DirectoryAdminPasswordSecretArn:
+    Type: String
+    Description: ARN of Secrets Manager secret with 'password'
+
+  DirectoryOUPath:
+    Type: String
+    Default: "OU=SQLServers,OU=Cloud"
+    Description: Optional OU path for domain join
+
+  InstanceType:
+    Type: String
+    Default: t3.large
+   AllowedValues: [t3.large, t3.xlarge, t2.2xlarge] 
+    Description: EC2 instance type
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 KeyPair name
+
+  AmiId:
+    Type: String
+    Description: Windows Server AMI ID
+
+  RootVolumeSizeGiB:
+    Type: Number
+    Default: 100
+    AllowedValues: [50, 120, 150, 180, 200, 250]
+    Description: Root volume size
+
+  RootVolumeType:
+    Type: String
+    Default: gp3
+    AllowedValues: [gp3, gp2, io1, io2]
+    Description: Volume type
+
+  KmsKeyId:
+    Type: String
+    Description: KMS Key ID for encryption
+
+Resources:
+
+  ## DHCP Options for domain resolution
+  DhcpOptions:
+    Type: AWS::EC2::DHCPOptions
+    Properties:
+      DomainName: !Ref DirectoryName
+      DomainNameServers:
+        - AmazonProvidedDNS
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentTag}-DHCPOptions"
+
+  DhcpOptionsAssociation:
+    Type: AWS::EC2::VPCDHCPOptionsAssociation
+    Properties:
+      VpcId: !Ref VpcId
+      DhcpOptionsId: !Ref DhcpOptions
+
+  ## AWS Managed Microsoft AD
+  ManagedDirectory:
+    Type: AWS::DirectoryService::MicrosoftAD
+    Properties:
+      Name: !Ref DirectoryName
+      ShortName: !Ref DirectoryShortName
+      Password: !Sub "{{resolve:secretsmanager:${DirectoryAdminPasswordSecretArn}:SecretString:password}}"
+      Edition: !Ref DirectoryEdition
+      VpcSettings:
+        VpcId: !Ref VpcId
+        SubnetIds:
+          - !Ref PrivateSubnet1Id
+          - !Ref PrivateSubnet2Id
+      Tags:
+        - Key: Name
+          Value: !Sub "AD-${EnvironmentTag}"
+
+  ## IAM Role and Instance Profile
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonSSMDirectoryServiceAccess
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref EC2Role]
+
+  ## EC2 Instance for SQL Server
+  SqlServerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SubnetId: !Ref PrivateSubnet1Id
+      SecurityGroupIds: [!Ref SecurityGroupId]
+      ImageId: !Ref AmiId
+      KeyName: !Ref KeyName
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            Encrypted: true
+            KmsKeyId: !Ref KmsKeyId
+            VolumeSize: !Ref RootVolumeSizeGiB
+            VolumeType: !Ref RootVolumeType
+      Tags:
+        - Key: Name
+          Value: !Sub "SQLServer-${EnvironmentTag}"
+
+      UserData:
+        Fn::Base64: !Sub |
+          <powershell>
+          Set-ExecutionPolicy RemoteSigned -Force
+          iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+          choco install sql-server-management-studio -y
+          New-NetFirewallRule -DisplayName "Allow SQL Server 1433" -Direction Inbound -Protocol TCP -LocalPort 1433 -Action Allow
+          </powershell>
+
+  ## SSM Domain Join with OU Placement
+  JoinDomainAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      Name: AWS-JoinDirectoryServiceDomain
+      AssociationName: !Sub "JoinDomain-${EnvironmentTag}"
+      Targets:
+        - Key: InstanceIds
+          Values:
+            - !Ref SqlServerInstance
+      Parameters:
+        directoryId:
+          - !Ref ManagedDirectory
+        directoryName:
+          - !Ref DirectoryName
+        userName:
+          - !Sub "${DirectoryShortName}\\Admin"
+        password:
+          - !Sub "{{resolve:secretsmanager:${DirectoryAdminPasswordSecretArn}:SecretString:password}}"
+        specifyOU:
+          - !Sub "${DirectoryOUPath},DC=${DirectoryShortName},DC=local"
+      AutomationTargetParameterName: InstanceId
+      ScheduleExpression: rate(1 day)
+
+Outputs:
+  DirectoryId:
+    Value: !Ref ManagedDirectory
+  SqlServerInstanceId:
+    Value: !Ref SqlServerInstance
+  SqlServerPrivateIp:
+    Value: !GetAtt SqlServerInstance.PrivateIp
