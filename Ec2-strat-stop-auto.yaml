@@ -1,0 +1,244 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Automated EC2 start/stop scheduler using Lambda and EventBridge.
+  Supports tag-based or explicit instance ID targeting, CloudWatch Logs with KMS, and least-privilege IAM.
+
+Parameters:
+  EnvironmentTag:
+    Type: String
+    Default: Dev
+    AllowedValues: [Dev, Test, Prod]
+    Description: Environment tag applied to resources
+
+  Region:
+    Type: String
+    Default: us-east-2
+    Description: AWS Region for EC2 API calls
+
+  # Scheduling
+  StartScheduleExpression:
+    Type: String
+    Default: cron(0 11 ? * 2-6 *)     # 11:00 UTC daily
+    Description: EventBridge schedule expression to start instances (cron or rate)
+  StopScheduleExpression:
+    Type: String
+    Default: cron(0 23 ? * 2-6 *)    # 23:00 UTC daily
+    Description: EventBridge schedule expression to stop instances (cron or rate)
+
+  # Targeting mode
+  ScheduleByTag:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: If true, select instances by tags; if false, use explicit instance IDs
+  TagKey:
+    Type: String
+    Default: Schedule
+    Description: Tag key used to filter instances (e.g., 'Schedule')
+  TagOnValue:
+    Type: String
+    Default: start
+    Description: Tag value that marks instances to start
+  TagOffValue:
+    Type: String
+    Default: stop
+    Description: Tag value that marks instances to stop
+
+  InstanceIds:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: Comma-separated EC2 instance IDs to manage when ScheduleByTag=false (e.g., i-0123abc,i-0456def)
+
+  # Logging and audit
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    Description: CloudWatch Logs retention in days
+  LogsKmsKeyArn:
+    Type: String
+    Default: ''
+    Description: Optional KMS key ARN to encrypt CloudWatch Logs
+
+Conditions:
+  UseTagMode: !Equals [!Ref ScheduleByTag, 'true']
+  HasInstanceIds: !Not [!Equals [!Join ['', !Ref InstanceIds], '']]
+  UseLogsKms: !Not [!Equals [!Ref LogsKmsKeyArn, '']]
+
+Resources:
+
+  # Log group for Lambda (encrypted if KMS provided)
+  SchedulerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/EC2-Scheduler-${EnvironmentTag}"
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !If [UseLogsKms, !Ref LogsKmsKeyArn, !Ref 'AWS::NoValue']
+    DeletionPolicy: Retain
+
+  # IAM role for Lambda with least-privilege EC2 + logging
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "EC2-Scheduler-Role-${EnvironmentTag}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EC2SchedulerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:StartInstances
+                  - ec2:StopInstances
+                Resource: "*"
+
+  # Lambda function that starts/stops instances based on event "action" and tag/ID targeting mode
+  EC2ScheduleLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "EC2-Scheduler-${EnvironmentTag}"
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          REGION: !Ref Region
+          TAG_KEY: !Ref TagKey
+          TAG_ON_VALUE: !Ref TagOnValue
+          TAG_OFF_VALUE: !Ref TagOffValue
+          SCHEDULE_BY_TAG: !Ref ScheduleByTag
+          INSTANCE_IDS: !Join [',', !Ref InstanceIds]
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+
+          REGION = os.environ.get('REGION', 'us-east-1')
+          TAG_KEY = os.environ.get('TAG_KEY', 'Schedule')
+          TAG_ON_VALUE = os.environ.get('TAG_ON_VALUE', 'start')
+          TAG_OFF_VALUE = os.environ.get('TAG_OFF_VALUE', 'stop')
+          SCHEDULE_BY_TAG = os.environ.get('SCHEDULE_BY_TAG', 'true').lower() == 'true'
+          INSTANCE_IDS = [i for i in os.environ.get('INSTANCE_IDS', '').split(',') if i.strip()]
+
+          ec2 = boto3.client('ec2', region_name=REGION)
+
+          def list_instances_by_tag(tag_value):
+              paginator = ec2.get_paginator('describe_instances')
+              filters = [{'Name': f'tag:{TAG_KEY}', 'Values': [tag_value]}]
+              ids = []
+              for page in paginator.paginate(Filters=filters):
+                  for r in page.get('Reservations', []):
+                      for inst in r.get('Instances', []):
+                          ids.append(inst['InstanceId'])
+              return ids
+
+          def lambda_handler(event, context):
+              action = (event or {}).get('action')
+              if action not in ('start', 'stop'):
+                  raise ValueError(f"Invalid or missing action: {action}")
+
+              if SCHEDULE_BY_TAG:
+                  ids = list_instances_by_tag(TAG_ON_VALUE if action == 'start' else TAG_OFF_VALUE)
+              else:
+                  ids = INSTANCE_IDS
+
+              if not ids:
+                  print(f"No target instances for action '{action}'.")
+                  return {'action': action, 'targets': []}
+
+              if action == 'start':
+                  resp = ec2.start_instances(InstanceIds=ids)
+              else:
+                  resp = ec2.stop_instances(InstanceIds=ids)
+
+              print({'action': action, 'targets': ids, 'response': resp})
+              return {'action': action, 'targets': ids}
+
+  # Permission for Logs KMS (optional) - Lambda writes logs; encryption controlled by log group above.
+  LambdaLogGroupPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EC2ScheduleLambda
+      Action: lambda:InvokeFunction
+      Principal: logs.amazonaws.com
+
+  # EventBridge rules: one for start, one for stop; both invoke Lambda with input payload specifying action
+  StartRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "EC2-Start-Rule-${EnvironmentTag}"
+      ScheduleExpression: !Ref StartScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt EC2ScheduleLambda.Arn
+          Id: "StartTarget"
+          Input: '{"action":"start"}'
+      Description: !Sub "Start EC2 instances on schedule (${EnvironmentTag})"
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+
+  StopRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "EC2-Stop-Rule-${EnvironmentTag}"
+      ScheduleExpression: !Ref StopScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt EC2ScheduleLambda.Arn
+          Id: "StopTarget"
+          Input: '{"action":"stop"}'
+      Description: !Sub "Stop EC2 instances on schedule (${EnvironmentTag})"
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+
+  # Allow EventBridge to invoke Lambda
+  StartInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EC2ScheduleLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt StartRule.Arn
+
+  StopInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EC2ScheduleLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt StopRule.Arn
+
+Outputs:
+  LambdaFunctionName:
+    Description: Lambda function name
+    Value: !Ref EC2ScheduleLambda
+  StartRuleName:
+    Description: EventBridge start rule
+    Value: !Ref StartRule
+  StopRuleName:
+    Description: EventBridge stop rule
+    Value: !Ref StopRule
+
+
+
+
+
+
+
+
+
+
+
+
